@@ -5,11 +5,22 @@
 """
 import json
 import os
+import socket
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+# На многих VPS сломан IPv6: соединение висит до таймаута. Подключаемся только по IPv4.
+_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_only(host, port, family=0, *args, **kwargs):
+    return _getaddrinfo(host, port, socket.AF_INET, *args, **kwargs)
+
+
+socket.getaddrinfo = _ipv4_only
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "data.json")
