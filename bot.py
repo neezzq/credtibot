@@ -1,8 +1,10 @@
 """Простой бот поддержки для Telegram (без внешних зависимостей).
 
-Пользователь пишет боту -> сообщение приходит админу.
-Админ отвечает через "Ответить" (reply) на это сообщение -> ответ уходит пользователю.
+Пользователь отправляет обращение командой /hi текст -> заявка приходит админу
+с кнопками (профиль, ответить, бан).
+Админ отвечает кнопкой "Ответить" или через Reply на заявку -> ответ уходит пользователю.
 """
+import html
 import json
 import os
 import socket
@@ -42,20 +44,25 @@ load_env()
 TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_ID", "").replace(" ", "").split(",") if x}
 WELCOME = os.environ.get(
-    "WELCOME_TEXT", "Здравствуйте! Напишите ваш вопрос, и мы ответим как можно скорее."
+    "WELCOME_TEXT", "Здравствуйте! Чтобы отправить обращение, напишите:\n/hi ваш вопрос"
 )
-CONFIRM = os.environ.get("CONFIRM_TEXT", "Сообщение получено, скоро ответим.")
+CONFIRM = os.environ.get("CONFIRM_TEXT", "Обращение #{n} получено, скоро ответим.")
+HINT = "Чтобы отправить обращение, напишите команду с текстом:\n/hi ваш вопрос"
 
 if not TOKEN:
     sys.exit("Укажите BOT_TOKEN в файле .env (см. .env.example)")
 
 API = f"https://api.telegram.org/bot{TOKEN}/"
 
-# msg_map: id сообщения в чате админа -> id пользователя; banned: список забаненных
-data = {"msg_map": {}, "banned": []}
+# msg_map: id сообщения в чате админа -> id пользователя; banned: список забаненных;
+# counter: номер последнего обращения
+data = {"msg_map": {}, "banned": [], "counter": 0}
 if os.path.exists(DATA_FILE):
     with open(DATA_FILE, encoding="utf-8") as f:
         data.update(json.load(f))
+
+# админ -> пользователь, которому он сейчас пишет ответ (после кнопки "Ответить")
+reply_target = {}
 
 
 def save():
@@ -87,12 +94,35 @@ def send(chat_id, text, **kw):
     return call("sendMessage", chat_id=chat_id, text=text, **kw)
 
 
+def full_name(user):
+    return (user.get("first_name", "") + " " + user.get("last_name", "")).strip() or "Без имени"
+
+
+def ticket_keyboard(uid, username):
+    rows = []
+    if username:
+        rows.append([{"text": f"👤 @{username}", "url": f"https://t.me/{username}"}])
+    ban = (
+        {"text": "✅ Разбанить", "callback_data": f"unban:{uid}"}
+        if uid in data["banned"]
+        else {"text": "🚫 Забанить", "callback_data": f"ban:{uid}"}
+    )
+    rows.append([{"text": "✉️ Ответить", "callback_data": f"reply:{uid}"}, ban])
+    return {"inline_keyboard": rows}
+
+
+def parse_command(text):
+    """'/hi@bot текст' -> ('/hi', 'текст')"""
+    cmd, _, rest = text.partition(" ")
+    return cmd.split("@")[0].lower(), rest.strip()
+
+
 def handle_user(msg):
     user = msg["from"]
     uid = user["id"]
-    text = msg.get("text", "")
+    cmd, arg = parse_command(msg.get("text", ""))
 
-    if text.startswith("/start"):
+    if cmd == "/start":
         if not ADMIN_IDS:
             send(uid, f"Ваш ID: {uid}\nВпишите его в ADMIN_ID в файле .env и перезапустите бота.")
         else:
@@ -100,62 +130,102 @@ def handle_user(msg):
         return
     if uid in data["banned"]:
         return
+    if cmd != "/hi":
+        send(uid, HINT)
+        return
+    if not arg:
+        send(uid, "Напишите текст обращения после команды, например:\n/hi не приходит код")
+        return
 
-    name = user.get("first_name", "") + (" " + user["last_name"] if user.get("last_name") else "")
-    uname = f"@{user['username']}" if user.get("username") else "без username"
-    header = f"📩 {name} ({uname})\nID: {uid}"
-
+    data["counter"] += 1
+    n = data["counter"]
+    username = user.get("username")
+    text = (
+        f"📩 <b>Обращение #{n}</b>\n"
+        f'👤 <a href="tg://user?id={uid}">{html.escape(full_name(user))}</a>'
+        + (f" (@{username})" if username else "")
+        + f"\n🆔 <code>{uid}</code>\n\n"
+        + html.escape(arg[:3500])
+    )
     for admin in ADMIN_IDS:
-        h = send(admin, header)
-        c = call("copyMessage", chat_id=admin, from_chat_id=uid, message_id=msg["message_id"])
-        for m in (h, c):
-            if m:
-                data["msg_map"][str(m["message_id"])] = uid
+        m = send(admin, text, parse_mode="HTML", reply_markup=ticket_keyboard(uid, username))
+        if m:
+            data["msg_map"][str(m["message_id"])] = uid
     save()
-    send(uid, CONFIRM)
+    send(uid, CONFIRM.format(n=n))
+
+
+def handle_callback(cq):
+    admin = cq["from"]["id"]
+    if admin not in ADMIN_IDS:
+        call("answerCallbackQuery", callback_query_id=cq["id"])
+        return
+    action, _, uid = cq.get("data", "").partition(":")
+    uid = int(uid)
+    msg = cq.get("message")
+
+    if action == "reply":
+        reply_target[admin] = uid
+        call("answerCallbackQuery", callback_query_id=cq["id"])
+        send(admin, f"✍️ Напишите ответ пользователю {uid} одним сообщением.\n/cancel — отмена")
+        return
+
+    if action == "ban" and uid not in data["banned"]:
+        data["banned"].append(uid)
+    elif action == "unban" and uid in data["banned"]:
+        data["banned"].remove(uid)
+    save()
+    call(
+        "answerCallbackQuery",
+        callback_query_id=cq["id"],
+        text="🚫 Заблокирован" if action == "ban" else "✅ Разблокирован",
+    )
+    if msg:
+        # достаём username из кнопки профиля, чтобы не потерять её при обновлении
+        rows = msg.get("reply_markup", {}).get("inline_keyboard", [])
+        url = next((b.get("url", "") for r in rows for b in r if "url" in b), "")
+        username = url.rsplit("/", 1)[-1] if url else None
+        call(
+            "editMessageReplyMarkup",
+            chat_id=msg["chat"]["id"],
+            message_id=msg["message_id"],
+            reply_markup=ticket_keyboard(uid, username),
+        )
+
+
+def answer_user(admin, msg, uid):
+    res = call("copyMessage", chat_id=uid, from_chat_id=admin, message_id=msg["message_id"])
+    send(admin, "✅ Отправлено" if res else "❌ Не удалось отправить (бот заблокирован пользователем?)")
 
 
 def handle_admin(msg):
-    text = msg.get("text", "")
+    admin = msg["from"]["id"]
+    cmd, _ = parse_command(msg.get("text", ""))
     reply = msg.get("reply_to_message")
 
-    if text.startswith("/start") or text.startswith("/help"):
+    if cmd in ("/start", "/help"):
         send(
-            msg["chat"]["id"],
-            "Чтобы ответить пользователю — сделайте Reply на его сообщение.\n"
-            "/ban — (reply) заблокировать пользователя\n"
-            "/unban — (reply) разблокировать\n"
-            "Поддерживаются текст, фото, файлы, голосовые и т.д.",
+            admin,
+            "Обращения приходят с кнопками:\n"
+            "✉️ Ответить — следующее ваше сообщение уйдёт пользователю\n"
+            "🚫 Забанить / ✅ Разбанить\n\n"
+            "Ещё можно сделать Reply на обращение — ответ уйдёт автору.\n"
+            "/cancel — отменить ответ",
         )
         return
-
-    if not reply:
-        send(msg["chat"]["id"], "Сделайте Reply на сообщение пользователя, чтобы ответить.")
+    if cmd == "/cancel":
+        reply_target.pop(admin, None)
+        send(admin, "Отменено.")
         return
 
-    uid = data["msg_map"].get(str(reply["message_id"]))
-    if not uid:
-        send(msg["chat"]["id"], "Не удалось определить пользователя (сообщение слишком старое?).")
-        return
-
-    if text.startswith("/ban"):
-        if uid not in data["banned"]:
-            data["banned"].append(uid)
-            save()
-        send(msg["chat"]["id"], f"🚫 Пользователь {uid} заблокирован.")
-    elif text.startswith("/unban"):
-        if uid in data["banned"]:
-            data["banned"].remove(uid)
-            save()
-        send(msg["chat"]["id"], f"✅ Пользователь {uid} разблокирован.")
+    uid = data["msg_map"].get(str(reply["message_id"])) if reply else None
+    if uid:
+        reply_target.pop(admin, None)
+        answer_user(admin, msg, uid)
+    elif admin in reply_target:
+        answer_user(admin, msg, reply_target.pop(admin))
     else:
-        res = call(
-            "copyMessage",
-            chat_id=uid,
-            from_chat_id=msg["chat"]["id"],
-            message_id=msg["message_id"],
-        )
-        send(msg["chat"]["id"], "✅ Отправлено" if res else "❌ Не удалось отправить (бот заблокирован пользователем?)")
+        send(admin, "Нажмите «✉️ Ответить» под обращением или сделайте Reply на него.")
 
 
 def main():
@@ -165,16 +235,21 @@ def main():
     print(f"Бот @{me['username']} запущен. Админы: {ADMIN_IDS or 'не заданы'}")
     offset = 0
     while True:
-        updates = call("getUpdates", offset=offset, timeout=30, allowed_updates=["message"])
+        updates = call(
+            "getUpdates", offset=offset, timeout=30, allowed_updates=["message", "callback_query"]
+        )
         if updates is None:
             time.sleep(3)
             continue
         for u in updates:
             offset = u["update_id"] + 1
-            msg = u.get("message")
-            if not msg or msg["chat"]["type"] != "private":
-                continue
             try:
+                if "callback_query" in u:
+                    handle_callback(u["callback_query"])
+                    continue
+                msg = u.get("message")
+                if not msg or msg["chat"]["type"] != "private":
+                    continue
                 if msg["from"]["id"] in ADMIN_IDS:
                     handle_admin(msg)
                 else:
