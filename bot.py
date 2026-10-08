@@ -3,6 +3,7 @@
 Пользователь отправляет обращение командой /hi текст -> заявка приходит админу
 с кнопками (профиль, ответить, бан).
 Админ отвечает кнопкой "Ответить" или через Reply на заявку -> ответ уходит пользователю.
+/tickets — список всех обращений с листанием.
 """
 import html
 import json
@@ -13,6 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 # На многих VPS сломан IPv6: соединение висит до таймаута. Подключаемся только по IPv4.
 _getaddrinfo = socket.getaddrinfo
@@ -48,6 +50,9 @@ WELCOME = os.environ.get(
 )
 CONFIRM = os.environ.get("CONFIRM_TEXT", "Обращение #{n} получено, скоро ответим.")
 HINT = "Чтобы отправить обращение, напишите команду с текстом:\n/hi ваш вопрос"
+# часовой пояс для дат в списке обращений (по умолчанию МСК, UTC+3)
+TZ = timezone(timedelta(hours=float(os.environ.get("TZ_OFFSET", "3"))))
+PAGE_SIZE = 5
 
 if not TOKEN:
     sys.exit("Укажите BOT_TOKEN в файле .env (см. .env.example)")
@@ -55,8 +60,8 @@ if not TOKEN:
 API = f"https://api.telegram.org/bot{TOKEN}/"
 
 # msg_map: id сообщения в чате админа -> id пользователя; banned: список забаненных;
-# counter: номер последнего обращения
-data = {"msg_map": {}, "banned": [], "counter": 0}
+# counter: номер последнего обращения; tickets: все обращения
+data = {"msg_map": {}, "banned": [], "counter": 0, "tickets": []}
 if os.path.exists(DATA_FILE):
     with open(DATA_FILE, encoding="utf-8") as f:
         data.update(json.load(f))
@@ -71,10 +76,11 @@ def save():
         for k in list(data["msg_map"])[:-5000]:
             del data["msg_map"][k]
     with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f)
+        json.dump(data, f, ensure_ascii=False)
 
 
 def call(method, **params):
+    params = {k: v for k, v in params.items() if v is not None}
     req = urllib.request.Request(
         API + method,
         data=json.dumps(params).encode(),
@@ -98,6 +104,26 @@ def full_name(user):
     return (user.get("first_name", "") + " " + user.get("last_name", "")).strip() or "Без имени"
 
 
+def fmt_date(ts):
+    return datetime.fromtimestamp(ts, TZ).strftime("%d.%m.%Y %H:%M")
+
+
+def who(t):
+    name = f'<a href="tg://user?id={t["uid"]}">{html.escape(t["name"])}</a>'
+    return name + (f" (@{t['username']})" if t.get("username") else "")
+
+
+def ticket_text(t):
+    status = "✅ отвечено" if t.get("answered") else "🕐 ждёт ответа"
+    return (
+        f"📩 <b>Обращение #{t['n']}</b> · {status}\n"
+        f"📅 {fmt_date(t['date'])}\n"
+        f"👤 {who(t)}\n"
+        f"🆔 <code>{t['uid']}</code>\n\n"
+        + html.escape(t["text"])
+    )
+
+
 def ticket_keyboard(uid, username):
     rows = []
     if username:
@@ -109,6 +135,56 @@ def ticket_keyboard(uid, username):
     )
     rows.append([{"text": "✉️ Ответить", "callback_data": f"reply:{uid}"}, ban])
     return {"inline_keyboard": rows}
+
+
+def send_ticket(admin, t):
+    m = send(admin, ticket_text(t), parse_mode="HTML", reply_markup=ticket_keyboard(t["uid"], t.get("username")))
+    if m:
+        data["msg_map"][str(m["message_id"])] = t["uid"]
+    return m
+
+
+def tickets_page(page, order):
+    """Текст и кнопки страницы списка. order: 'new' — сначала новые, 'old' — сначала старые."""
+    tickets = sorted(data["tickets"], key=lambda t: (t["date"], t["n"]), reverse=order == "new")
+    total = len(tickets)
+    if not total:
+        return "📋 Обращений пока нет.", None
+    pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+    page = max(0, min(page, pages - 1))
+    chunk = tickets[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+    waiting = sum(1 for t in tickets if not t.get("answered"))
+
+    lines = [
+        f"📋 <b>Обращения</b>: всего {total}, ждут ответа {waiting}\n"
+        f"Сортировка: {'сначала новые' if order == 'new' else 'сначала старые'}"
+    ]
+    for t in chunk:
+        preview = t["text"] if len(t["text"]) <= 100 else t["text"][:100] + "…"
+        lines.append(
+            f"<b>#{t['n']}</b> · {fmt_date(t['date'])} · {'✅' if t.get('answered') else '🕐'}\n"
+            f"👤 {who(t)}\n"
+            f"{html.escape(preview)}"
+        )
+
+    nav = []
+    if page > 0:
+        nav.append({"text": "◀️", "callback_data": f"page:{page - 1}:{order}"})
+    nav.append({"text": f"{page + 1}/{pages}", "callback_data": "noop"})
+    if page < pages - 1:
+        nav.append({"text": "▶️", "callback_data": f"page:{page + 1}:{order}"})
+    other = "old" if order == "new" else "new"
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": f"#{t['n']}", "callback_data": f"open:{t['n']}"} for t in chunk],
+            nav,
+            [{
+                "text": "🔃 Сначала старые" if order == "new" else "🔃 Сначала новые",
+                "callback_data": f"page:0:{other}",
+            }],
+        ]
+    }
+    return "\n\n".join(lines), keyboard
 
 
 def parse_command(text):
@@ -138,21 +214,20 @@ def handle_user(msg):
         return
 
     data["counter"] += 1
-    n = data["counter"]
-    username = user.get("username")
-    text = (
-        f"📩 <b>Обращение #{n}</b>\n"
-        f'👤 <a href="tg://user?id={uid}">{html.escape(full_name(user))}</a>'
-        + (f" (@{username})" if username else "")
-        + f"\n🆔 <code>{uid}</code>\n\n"
-        + html.escape(arg[:3500])
-    )
+    t = {
+        "n": data["counter"],
+        "uid": uid,
+        "name": full_name(user),
+        "username": user.get("username"),
+        "text": arg[:3500],
+        "date": int(time.time()),
+        "answered": False,
+    }
+    data["tickets"].append(t)
     for admin in ADMIN_IDS:
-        m = send(admin, text, parse_mode="HTML", reply_markup=ticket_keyboard(uid, username))
-        if m:
-            data["msg_map"][str(m["message_id"])] = uid
+        send_ticket(admin, t)
     save()
-    send(uid, CONFIRM.format(n=n))
+    send(uid, CONFIRM.format(n=t["n"]))
 
 
 def handle_callback(cq):
@@ -160,10 +235,36 @@ def handle_callback(cq):
     if admin not in ADMIN_IDS:
         call("answerCallbackQuery", callback_query_id=cq["id"])
         return
-    action, _, uid = cq.get("data", "").partition(":")
-    uid = int(uid)
+    action, _, arg = cq.get("data", "").partition(":")
     msg = cq.get("message")
 
+    if action == "noop":
+        call("answerCallbackQuery", callback_query_id=cq["id"])
+        return
+
+    if action == "page":
+        page, _, order = arg.partition(":")
+        text, keyboard = tickets_page(int(page), order)
+        call("answerCallbackQuery", callback_query_id=cq["id"])
+        call(
+            "editMessageText",
+            chat_id=msg["chat"]["id"],
+            message_id=msg["message_id"],
+            text=text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        return
+
+    if action == "open":
+        t = next((t for t in data["tickets"] if t["n"] == int(arg)), None)
+        call("answerCallbackQuery", callback_query_id=cq["id"], text="" if t else "Обращение не найдено")
+        if t:
+            send_ticket(admin, t)
+            save()
+        return
+
+    uid = int(arg)
     if action == "reply":
         reply_target[admin] = uid
         call("answerCallbackQuery", callback_query_id=cq["id"])
@@ -195,6 +296,11 @@ def handle_callback(cq):
 
 def answer_user(admin, msg, uid):
     res = call("copyMessage", chat_id=uid, from_chat_id=admin, message_id=msg["message_id"])
+    if res:
+        for t in data["tickets"]:
+            if t["uid"] == uid:
+                t["answered"] = True
+        save()
     send(admin, "✅ Отправлено" if res else "❌ Не удалось отправить (бот заблокирован пользователем?)")
 
 
@@ -210,12 +316,17 @@ def handle_admin(msg):
             "✉️ Ответить — следующее ваше сообщение уйдёт пользователю\n"
             "🚫 Забанить / ✅ Разбанить\n\n"
             "Ещё можно сделать Reply на обращение — ответ уйдёт автору.\n"
+            "/tickets — все обращения (по 5 на странице)\n"
             "/cancel — отменить ответ",
         )
         return
     if cmd == "/cancel":
         reply_target.pop(admin, None)
         send(admin, "Отменено.")
+        return
+    if cmd == "/tickets":
+        text, keyboard = tickets_page(0, "new")
+        send(admin, text, parse_mode="HTML", reply_markup=keyboard)
         return
 
     uid = data["msg_map"].get(str(reply["message_id"])) if reply else None
@@ -233,6 +344,20 @@ def main():
     if not me:
         sys.exit("Не удалось подключиться к Telegram. Проверьте BOT_TOKEN.")
     print(f"Бот @{me['username']} запущен. Админы: {ADMIN_IDS or 'не заданы'}")
+    call(
+        "setMyCommands",
+        commands=[{"command": "hi", "description": "Отправить обращение: /hi текст"}],
+    )
+    for admin in ADMIN_IDS:
+        call(
+            "setMyCommands",
+            scope={"type": "chat", "chat_id": admin},
+            commands=[
+                {"command": "tickets", "description": "Все обращения"},
+                {"command": "cancel", "description": "Отменить ответ"},
+                {"command": "help", "description": "Помощь"},
+            ],
+        )
     offset = 0
     while True:
         updates = call(
