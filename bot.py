@@ -59,22 +59,24 @@ if not TOKEN:
 
 API = f"https://api.telegram.org/bot{TOKEN}/"
 
-# msg_map: id сообщения в чате админа -> id пользователя; banned: список забаненных;
+# msg_map: id сообщения в чате админа -> id пользователя (старые заявки);
+# msg_ticket: id сообщения в чате админа -> номер обращения; banned: список забаненных;
 # counter: номер последнего обращения; tickets: все обращения
-data = {"msg_map": {}, "banned": [], "counter": 0, "tickets": []}
+data = {"msg_map": {}, "msg_ticket": {}, "banned": [], "counter": 0, "tickets": []}
 if os.path.exists(DATA_FILE):
     with open(DATA_FILE, encoding="utf-8") as f:
         data.update(json.load(f))
 
-# админ -> пользователь, которому он сейчас пишет ответ (после кнопки "Ответить")
+# админ -> номер обращения, на которое он сейчас пишет ответ (после кнопки "Ответить")
 reply_target = {}
 
 
 def save():
     # храним только последние 5000 связей
-    if len(data["msg_map"]) > 5000:
-        for k in list(data["msg_map"])[:-5000]:
-            del data["msg_map"][k]
+    for key in ("msg_map", "msg_ticket"):
+        if len(data[key]) > 5000:
+            for k in list(data[key])[:-5000]:
+                del data[key][k]
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
 
@@ -124,7 +126,8 @@ def ticket_text(t):
     )
 
 
-def ticket_keyboard(uid, username):
+def ticket_keyboard(t):
+    uid, username = t["uid"], t.get("username")
     rows = []
     if username:
         rows.append([{"text": f"👤 @{username}", "url": f"https://t.me/{username}"}])
@@ -133,15 +136,24 @@ def ticket_keyboard(uid, username):
         if uid in data["banned"]
         else {"text": "🚫 Забанить", "callback_data": f"ban:{uid}"}
     )
-    rows.append([{"text": "✉️ Ответить", "callback_data": f"reply:{uid}"}, ban])
+    rows.append([{"text": "✉️ Ответить", "callback_data": f"ans:{t['n']}"}, ban])
     return {"inline_keyboard": rows}
 
 
 def send_ticket(admin, t):
-    m = send(admin, ticket_text(t), parse_mode="HTML", reply_markup=ticket_keyboard(t["uid"], t.get("username")))
+    m = send(admin, ticket_text(t), parse_mode="HTML", reply_markup=ticket_keyboard(t))
     if m:
-        data["msg_map"][str(m["message_id"])] = t["uid"]
+        data["msg_ticket"][str(m["message_id"])] = t["n"]
     return m
+
+
+def find_ticket(n):
+    return next((t for t in data["tickets"] if t["n"] == n), None)
+
+
+def last_ticket(uid):
+    """Последнее обращение пользователя — для заявок, отправленных до появления номеров."""
+    return next((t for t in reversed(data["tickets"]) if t["uid"] == uid), None)
 
 
 def tickets_page(page, order):
@@ -257,20 +269,24 @@ def handle_callback(cq):
         return
 
     if action == "open":
-        t = next((t for t in data["tickets"] if t["n"] == int(arg)), None)
+        t = find_ticket(int(arg))
         call("answerCallbackQuery", callback_query_id=cq["id"], text="" if t else "Обращение не найдено")
         if t:
             send_ticket(admin, t)
             save()
         return
 
-    uid = int(arg)
-    if action == "reply":
-        reply_target[admin] = uid
+    if action in ("ans", "reply"):
+        # ans:<номер обращения>; reply:<id пользователя> — кнопки у старых заявок
+        t = find_ticket(int(arg)) if action == "ans" else last_ticket(int(arg))
+        uid = t["uid"] if t else int(arg)
+        reply_target[admin] = (uid, t["n"] if t else None)
         call("answerCallbackQuery", callback_query_id=cq["id"])
-        send(admin, f"✍️ Напишите ответ пользователю {uid} одним сообщением.\n/cancel — отмена")
+        about = f"по обращению #{t['n']}" if t else f"пользователю {uid}"
+        send(admin, f"✍️ Напишите ответ {about} одним сообщением.\n/cancel — отмена")
         return
 
+    uid = int(arg)
     if action == "ban" and uid not in data["banned"]:
         data["banned"].append(uid)
     elif action == "unban" and uid in data["banned"]:
@@ -281,26 +297,60 @@ def handle_callback(cq):
         callback_query_id=cq["id"],
         text="🚫 Заблокирован" if action == "ban" else "✅ Разблокирован",
     )
+    t = None
     if msg:
-        # достаём username из кнопки профиля, чтобы не потерять её при обновлении
+        # находим обращение по кнопке "Ответить", чтобы перерисовать клавиатуру заявки
         rows = msg.get("reply_markup", {}).get("inline_keyboard", [])
-        url = next((b.get("url", "") for r in rows for b in r if "url" in b), "")
-        username = url.rsplit("/", 1)[-1] if url else None
+        n = next((b["callback_data"][4:] for r in rows for b in r
+                  if b.get("callback_data", "").startswith("ans:")), None)
+        t = find_ticket(int(n)) if n else last_ticket(uid)
+    if t:
         call(
             "editMessageReplyMarkup",
             chat_id=msg["chat"]["id"],
             message_id=msg["message_id"],
-            reply_markup=ticket_keyboard(uid, username),
+            reply_markup=ticket_keyboard(t),
         )
 
 
-def answer_user(admin, msg, uid):
-    res = call("copyMessage", chat_id=uid, from_chat_id=admin, message_id=msg["message_id"])
+def utf16_len(s):
+    return len(s.encode("utf-16-le")) // 2
+
+
+def with_header(header, text, entities):
+    """Добавляет жирный заголовок перед текстом, сдвигая форматирование админа."""
+    prefix = header + ("\n\n" if text else "")
+    shift = utf16_len(prefix)
+    ents = [{"type": "bold", "offset": 0, "length": utf16_len(header)}]
+    ents += [dict(e, offset=e["offset"] + shift) for e in entities or []]
+    return prefix + (text or ""), ents
+
+
+CAPTION_TYPES = ("photo", "video", "document", "audio", "voice", "animation")
+
+
+def answer_user(admin, msg, uid, n):
+    header = f"Ответ по обращению #{n}" if n else "Ответ поддержки"
+    if "text" in msg:
+        text, ents = with_header(header, msg["text"], msg.get("entities"))
+        res = call("sendMessage", chat_id=uid, text=text, entities=ents)
+    elif any(k in msg for k in CAPTION_TYPES):
+        caption, ents = with_header(header, msg.get("caption"), msg.get("caption_entities"))
+        res = call(
+            "copyMessage", chat_id=uid, from_chat_id=admin, message_id=msg["message_id"],
+            caption=caption[:1024], caption_entities=ents,
+        )
+    else:
+        # стикеры, кружки и т.п. не поддерживают подпись — заголовок отдельным сообщением
+        text, ents = with_header(header, "", None)
+        res = call("sendMessage", chat_id=uid, text=text, entities=ents) and call(
+            "copyMessage", chat_id=uid, from_chat_id=admin, message_id=msg["message_id"]
+        )
     if res:
-        for t in data["tickets"]:
-            if t["uid"] == uid:
-                t["answered"] = True
-        save()
+        t = find_ticket(n) if n else None
+        if t:
+            t["answered"] = True
+            save()
     send(admin, "✅ Отправлено" if res else "❌ Не удалось отправить (бот заблокирован пользователем?)")
 
 
@@ -329,12 +379,21 @@ def handle_admin(msg):
         send(admin, text, parse_mode="HTML", reply_markup=keyboard)
         return
 
-    uid = data["msg_map"].get(str(reply["message_id"])) if reply else None
-    if uid:
+    target = None
+    if reply:
+        key = str(reply["message_id"])
+        if key in data["msg_ticket"]:
+            t = find_ticket(data["msg_ticket"][key])
+            target = (t["uid"], t["n"]) if t else None
+        elif key in data["msg_map"]:
+            uid = data["msg_map"][key]
+            t = last_ticket(uid)
+            target = (uid, t["n"] if t else None)
+    if target:
         reply_target.pop(admin, None)
-        answer_user(admin, msg, uid)
+        answer_user(admin, msg, *target)
     elif admin in reply_target:
-        answer_user(admin, msg, reply_target.pop(admin))
+        answer_user(admin, msg, *reply_target.pop(admin))
     else:
         send(admin, "Нажмите «✉️ Ответить» под обращением или сделайте Reply на него.")
 
